@@ -2,3 +2,10 @@ opencv-contrib-python
 streamlit
 pandas
 numpy
+pymongo
+flask
+flask-cors
+pyjwt
+schedule
+Pillow
+python-dotenv

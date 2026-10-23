@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import os
 import json
+from database import db_manager
 
 class FaceTracker:
     def __init__(self, model_file="face_model.yml", names_file="face_names.json"):
@@ -20,6 +21,28 @@ class FaceTracker:
         self.load_model()
 
     def load_model(self):
+        # Try MongoDB first, fallback to files
+        try:
+            if db_manager.connect():
+                faces = db_manager.get_all_faces()
+                self.known_face_names = {}
+                for face in faces:
+                    self.known_face_names[face["face_id"]] = face["name"]
+                if self.known_face_names:
+                    self.current_id = max(self.known_face_names.keys()) + 1
+                    print(f"Loaded {len(self.known_face_names)} faces from MongoDB.")
+                else:
+                    print("No faces found in MongoDB. Started fresh.")
+                db_manager.disconnect()
+            else:
+                # Fallback to files
+                self._load_from_files()
+        except Exception as e:
+            print(f"Error loading from MongoDB: {e}")
+            self._load_from_files()
+    
+    def _load_from_files(self):
+        """Fallback method to load from files"""
         if os.path.exists(self.model_file) and os.path.exists(self.names_file):
             try:
                 self.recognizer.read(self.model_file)
@@ -29,7 +52,7 @@ class FaceTracker:
                     self.known_face_names = {int(k): v for k, v in loaded_names.items()}
                 if self.known_face_names:
                     self.current_id = max(self.known_face_names.keys()) + 1
-                print(f"Loaded {len(self.known_face_names)} faces from {self.model_file}.")
+                print(f"Loaded {len(self.known_face_names)} faces from files.")
             except Exception as e:
                 print(f"Error loading model: {e}")
         else:
