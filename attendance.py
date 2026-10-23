@@ -2,254 +2,411 @@ import cv2
 import numpy as np
 import os
 import json
-from database import db_manager
+from pathlib import Path
+from database_manager import db_manager
+
+def non_max_suppression_fast(boxes, overlapThresh=0.35):
+    """Cleanly merges overlapping bounding boxes from multiple cascade passes"""
+    if len(boxes) == 0:
+        return []
+    if boxes.dtype.kind == "i":
+        boxes = boxes.astype("float")
+
+    pick = []
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+
+    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    idxs = np.argsort(y2)
+
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        pick.append(i)
+
+        xx1 = np.maximum(x1[i], x1[idxs[:last]])
+        yy1 = np.maximum(y1[i], y1[idxs[:last]])
+        xx2 = np.minimum(x2[i], x2[idxs[:last]])
+        yy2 = np.minimum(y2[i], y2[idxs[:last]])
+
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+
+        overlap = (w * h) / area[idxs[:last]]
+        idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlapThresh)[0])))
+
+    return boxes[pick].astype("int")
 
 class FaceTracker:
-    def __init__(self, model_file="face_model.yml", names_file="face_names.json"):
+    def __init__(self, model_file="face_model.yml", names_file="face_names.json", meta_file="face_metadata.json"):
         self.model_file = model_file
         self.names_file = names_file
+        self.meta_file = meta_file
         
-        # Load Haar Cascade for face detection
-        self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        # Dual cascades for maximum detection recall and pose tolerance
+        self.face_cascade_default = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.face_cascade_alt = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
         
-        # Create LBPH Face Recognizer
-        self.recognizer = cv2.face.LBPHFaceRecognizer_create()
+        # Local Binary Patterns Histograms (LBPH) Face Recognizer
+        self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8)
         
-        self.known_face_names = {} # Dict mapping integer ID to Name string
+        # CLAHE for illumination-invariant preprocessing
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        
+        self.known_face_names = {}      # face_id -> name string
+        self.known_students = {}        # face_id -> {student_id, prn, name, email}
         self.current_id = 0
+        self.model_trained = False
         
         self.load_model()
 
+    def preprocess_face(self, face_roi, target_size=(160, 160)):
+        """Standardizes face resolution, applies CLAHE lighting equalization and noise reduction"""
+        if face_roi.size == 0:
+            return None
+        resized = cv2.resize(face_roi, target_size)
+        equalized = self.clahe.apply(resized)
+        smoothed = cv2.GaussianBlur(equalized, (3, 3), 0)
+        return smoothed
+
+    def detect_faces(self, gray_frame):
+        """Runs dual cascade detectors with Non-Maximum Suppression to find all faces accurately"""
+        boxes1 = self.face_cascade_alt.detectMultiScale(
+            gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
+        )
+        boxes2 = self.face_cascade_default.detectMultiScale(
+            gray_frame, scaleFactor=1.15, minNeighbors=5, minSize=(60, 60)
+        )
+        
+        all_boxes = []
+        if len(boxes1) > 0:
+            all_boxes.extend(boxes1)
+        if len(boxes2) > 0:
+            all_boxes.extend(boxes2)
+            
+        if not all_boxes:
+            return []
+            
+        boxes_array = np.array(all_boxes)
+        clean_boxes = non_max_suppression_fast(boxes_array, overlapThresh=0.35)
+        return clean_boxes
+
     def load_model(self):
-        # Try MongoDB first, fallback to files
+        """Loads model file, names, and student metadata from DB and local cache"""
+        # 1. Sync from DB first
         try:
             if db_manager.connect():
-                faces = db_manager.get_all_faces()
-                self.known_face_names = {}
-                for face in faces:
-                    self.known_face_names[face["face_id"]] = face["name"]
+                db_faces = db_manager.get_all_faces_for_recognition()
+                for f in db_faces:
+                    fid = int(f.get("face_id", 0))
+                    self.known_face_names[fid] = f.get("name", "Unknown")
+                    self.known_students[fid] = {
+                        "face_id": fid,
+                        "name": f.get("name", ""),
+                        "student_id": f.get("student_id", ""),
+                        "prn": f.get("prn", "")
+                    }
                 if self.known_face_names:
                     self.current_id = max(self.known_face_names.keys()) + 1
-                    print(f"Loaded {len(self.known_face_names)} faces from MongoDB.")
-                else:
-                    print("No faces found in MongoDB. Started fresh.")
-                db_manager.disconnect()
-            else:
-                # Fallback to files
-                self._load_from_files()
         except Exception as e:
-            print(f"Error loading from MongoDB: {e}")
-            self._load_from_files()
-    
-    def _load_from_files(self):
-        """Fallback method to load from files"""
-        if os.path.exists(self.model_file) and os.path.exists(self.names_file):
+            print(f"Notice: sync from DB: {e}")
+
+        # 2. Sync from local files
+        if os.path.exists(self.names_file):
+            try:
+                with open(self.names_file, 'r') as f:
+                    data = json.load(f)
+                    for k, v in data.items():
+                        fid = int(k)
+                        self.known_face_names[fid] = v
+                        if fid not in self.known_students:
+                            self.known_students[fid] = {
+                                "face_id": fid,
+                                "name": v,
+                                "student_id": f"STU{fid:03d}",
+                                "prn": f"2024{fid:03d}"
+                            }
+                if self.known_face_names:
+                    self.current_id = max(self.current_id, max(self.known_face_names.keys()) + 1)
+            except Exception as e:
+                print(f"Error reading {self.names_file}: {e}")
+
+        if os.path.exists(self.meta_file):
+            try:
+                with open(self.meta_file, 'r') as f:
+                    meta = json.load(f)
+                    for k, v in meta.items():
+                        self.known_students[int(k)] = v
+            except Exception as e:
+                pass
+
+        # 3. Load trained LBPH model if exists
+        if os.path.exists(self.model_file) and os.path.getsize(self.model_file) > 1000:
             try:
                 self.recognizer.read(self.model_file)
-                with open(self.names_file, 'r') as f:
-                    # JSON keys are strings, convert back to int
-                    loaded_names = json.load(f)
-                    self.known_face_names = {int(k): v for k, v in loaded_names.items()}
-                if self.known_face_names:
-                    self.current_id = max(self.known_face_names.keys()) + 1
-                print(f"Loaded {len(self.known_face_names)} faces from files.")
+                self.model_trained = True
+                print(f"✅ Loaded LBPH model with {len(self.known_face_names)} identities.")
             except Exception as e:
-                print(f"Error loading model: {e}")
+                print(f"Could not read existing LBPH model ({e}). Will train on first registration.")
+                self.model_trained = False
         else:
-            print("No existing model found. Started fresh.")
+            print("No existing LBPH weights found. Ready for student registrations.")
 
     def save_model(self):
-        self.recognizer.write(self.model_file)
-        with open(self.names_file, 'w') as f:
-            json.dump(self.known_face_names, f)
-        print(f"Saved {len(self.known_face_names)} faces to {self.model_file}.")
-
-    def register_face(self, image_path, name):
-        """Registers a face from an image file."""
-        image = cv2.imread(image_path)
-        if image is None:
-            print(f"Could not read {image_path}.")
-            return False
-        return self.register_face_from_image(image, name)
-
-    def register_face_from_image(self, image, name):
-        """Registers a face from a decoded OpenCV image array with augmentation."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Stricter detection logic to prevent false positives like watches
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=8, minSize=(60, 60))
-        
-        if len(faces) > 0:
-            # Take the largest face found (most likely the human)
-            faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
-            (x, y, w, h) = faces[0]
-            face_roi = gray[y:y+h, x:x+w]
-            
-            # 1. Apply Histogram Equalization to flatten lighting immediately
-            face_roi = cv2.equalizeHist(face_roi)
-            
-            # Check if name already exists
-            person_id = -1
-            for k, v in self.known_face_names.items():
-                if v == name:
-                    person_id = k
-                    break
-                    
-            if person_id == -1:
-                person_id = self.current_id
-                self.known_face_names[person_id] = name
-                self.current_id += 1
-                
-            # Instead of training on 1 frame, build 5 augmented frames to force LBPH robustness
-            augmented_samples = [face_roi]
-            
-            # Aug 1: Brighter
-            aug_bright = cv2.convertScaleAbs(face_roi, alpha=1.2, beta=10)
-            augmented_samples.append(aug_bright)
-            
-            # Aug 2: Darker/Higher Contrast
-            aug_dark = cv2.convertScaleAbs(face_roi, alpha=1.1, beta=-15)
-            augmented_samples.append(aug_dark)
-            
-            # Aug 3: Slightly smaller (scale down and back up)
-            s_w = int(w * 0.9)
-            s_h = int(h * 0.9)
-            if s_w > 0 and s_h > 0:
-                small = cv2.resize(face_roi, (s_w, s_h))
-                aug_zoom = cv2.resize(small, (w, h))
-                augmented_samples.append(aug_zoom)
-                
-            # Aug 4: Slight blur
-            aug_blur = cv2.GaussianBlur(face_roi, (3, 3), 0)
-            augmented_samples.append(aug_blur)
-            
-            # Prepare arrays for OpenCV LBPH
-            ids_array = np.array([person_id] * len(augmented_samples))
-
-            # Train or update
-            if os.path.exists(self.model_file):
-                self.recognizer.update(augmented_samples, ids_array)
-            else:
-                self.recognizer.train(augmented_samples, ids_array)
-                
-            self.save_model()
-            print(f"Successfully registered: {name} with {len(augmented_samples)} synthetic views.")
+        """Persists trained weights and identity metadata"""
+        try:
+            self.recognizer.write(self.model_file)
+            with open(self.names_file, 'w') as f:
+                json.dump({str(k): v for k, v in self.known_face_names.items()}, f, indent=2)
+            with open(self.meta_file, 'w') as f:
+                json.dump({str(k): v for k, v in self.known_students.items()}, f, indent=2)
+            print(f"✅ Saved face model with {len(self.known_face_names)} profiles to {self.model_file}")
             return True
-        else:
-            print(f"Could not find any robust faces in the provided frame. Adjust lighting or get closer.")
+        except Exception as e:
+            print(f"Error saving face model: {e}")
             return False
-            
-    def register_from_webcam(self, name):
-        """Registers a face directly communicating with the webcam."""
-        cap = cv2.VideoCapture(0)
-        print(f"Press 's' to capture the face for {name}. Press 'q' to quit without saving.")
-        print("For best results, press 's' multiple times to capture different angles.")
-        
-        face_samples = []
-        ids = []
-        
-        # Determine ID
-        person_id = -1
-        for k, v in self.known_face_names.items():
-            if v == name:
-                person_id = k
+
+    def generate_augmentations(self, face_roi):
+        """Generates 10 illumination and pose invariant variations of face ROI for LBPH training"""
+        preprocessed = self.preprocess_face(face_roi)
+        if preprocessed is None:
+            return []
+
+        h, w = preprocessed.shape
+        samples = [preprocessed]
+
+        # 1. Brightness +20
+        samples.append(cv2.convertScaleAbs(preprocessed, alpha=1.0, beta=20))
+        # 2. Brightness -20
+        samples.append(cv2.convertScaleAbs(preprocessed, alpha=1.0, beta=-20))
+        # 3. Enhanced Contrast (CLAHE 3.0)
+        c3 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        samples.append(c3.apply(preprocessed))
+        # 4. Horizontal Flip (Mirror)
+        samples.append(cv2.flip(preprocessed, 1))
+        # 5. Rotate +5 degrees
+        M_rot_p = cv2.getRotationMatrix2D((w / 2, h / 2), 5, 1.0)
+        samples.append(cv2.warpAffine(preprocessed, M_rot_p, (w, h), borderMode=cv2.BORDER_REFLECT))
+        # 6. Rotate -5 degrees
+        M_rot_n = cv2.getRotationMatrix2D((w / 2, h / 2), -5, 1.0)
+        samples.append(cv2.warpAffine(preprocessed, M_rot_n, (w, h), borderMode=cv2.BORDER_REFLECT))
+        # 7. Zoom in 105%
+        crop_w, crop_h = int(w * 0.95), int(h * 0.95)
+        start_x, start_y = (w - crop_w) // 2, (h - crop_h) // 2
+        cropped = preprocessed[start_y:start_y + crop_h, start_x:start_x + crop_w]
+        samples.append(cv2.resize(cropped, (w, h)))
+        # 8. Zoom out 95%
+        small = cv2.resize(preprocessed, (int(w * 0.95), int(h * 0.95)))
+        padded = cv2.copyMakeBorder(small, 4, 4, 4, 4, cv2.BORDER_REFLECT)
+        samples.append(cv2.resize(padded, (w, h)))
+        # 9. Gentle Gaussian blur
+        samples.append(cv2.GaussianBlur(preprocessed, (5, 5), 0))
+
+        return samples
+
+    def register_student_face(self, bgr_image, student_id, name, prn, email=""):
+        """Extracts face, runs augmentations, updates LBPH model and persists metadata"""
+        if bgr_image is None or bgr_image.size == 0:
+            return False, "Invalid image", None
+
+        gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
+        boxes = self.detect_faces(gray)
+
+        if len(boxes) == 0:
+            return False, "No face detected in the photo. Please align your face in good lighting.", None
+
+        # Pick the largest face (most prominent subject)
+        boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+        (x, y, w, h) = boxes[0]
+
+        # Add 5% padding around face if possible
+        pad_x = int(w * 0.05)
+        pad_y = int(h * 0.05)
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(gray.shape[1], x + w + pad_x)
+        y2 = min(gray.shape[0], y + h + pad_y)
+        face_roi = gray[y1:y2, x1:x2]
+
+        # Determine face_id
+        target_fid = -1
+        for fid, sinfo in self.known_students.items():
+            if sinfo.get("student_id") == student_id or sinfo.get("prn") == prn:
+                target_fid = fid
                 break
-        if person_id == -1:
-            person_id = self.current_id
-        
-        captures = 0
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            # Stricter detection for active webcam feed too
-            faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=8, minSize=(60, 60))
-            
-            display_frame = frame.copy()
-            for (x, y, w, h) in faces:
-                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-                
-            cv2.imshow("Register Face", display_frame)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('s'):
-                if len(faces) > 0:
-                    faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
-                    (x, y, w, h) = faces[0]
-                    face_roi = gray[y:y+h, x:x+w]
-                    
-                    # Force eq before saving to sample block
-                    face_roi = cv2.equalizeHist(face_roi)
-                    face_samples.append(face_roi)
-                    ids.append(person_id)
-                    captures += 1
-                    print(f"Captured {captures} samples for {name}")
-                else:
-                    print("No face detected! Try again.")
-            elif key == ord('q') or key == 27:
-                break
-                
-        cap.release()
-        cv2.destroyAllWindows()
-        
-        if len(face_samples) > 0:
-            if person_id == self.current_id:
-                self.known_face_names[person_id] = name
-                self.current_id += 1
-                
-            if os.path.exists(self.model_file):
-                self.recognizer.update(face_samples, np.array(ids))
+
+        if target_fid == -1:
+            target_fid = self.current_id
+            self.current_id += 1
+
+        self.known_face_names[target_fid] = name
+        self.known_students[target_fid] = {
+            "face_id": target_fid,
+            "student_id": student_id,
+            "prn": prn,
+            "name": name,
+            "email": email
+        }
+
+        # Generate robust augmentations
+        samples = self.generate_augmentations(face_roi)
+        labels = np.array([target_fid] * len(samples))
+
+        try:
+            if self.model_trained:
+                self.recognizer.update(samples, labels)
             else:
-                self.recognizer.train(face_samples, np.array(ids))
-                
+                self.recognizer.train(samples, labels)
+                self.model_trained = True
+
             self.save_model()
-            print(f"Successfully registered {name} with {captures} samples.")
-        else:
-            print("Registration cancelled or no samples saved.")
+            print(f"🎉 Successfully registered face for {name} ({student_id}) with {len(samples)} augmented samples!")
+            return True, "Registration successful", target_fid
+        except Exception as e:
+            print(f"Error training face model: {e}")
+            return False, f"Model training error: {str(e)}", None
 
     def identify_faces(self, frame):
-        """Finds all faces in a frame and returns their names and locations."""
-        if not self.known_face_names:
-            return [], []
-            
+        """Finds all faces in frame and returns bounding boxes and identified student information"""
+        if frame is None or frame.size == 0:
+            return []
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Find all faces
-        # Match strict sizes to avoid background patterns
-        faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=8, minSize=(60, 60))
+        boxes = self.detect_faces(gray)
 
-        face_names = []
-        face_locations = []
-        
-        for (x, y, w, h) in faces:
-            # Isolate and aggressively equalize lighting just like during training
+        results = []
+        for (x, y, w, h) in boxes:
             face_roi = gray[y:y+h, x:x+w]
-            face_roi = cv2.equalizeHist(face_roi)
-            
-            # Predict
-            label_id, confidence = self.recognizer.predict(face_roi)
-            
-            # Confidence in LBPH is internal distance. Lower is better. 
-            # Default was 75. 55 is much stricter, preventing misidentification.
-            if confidence < 55:  
-                name = self.known_face_names.get(label_id, "Unknown")
-            else:
-                name = "Unknown"
-                
-            face_names.append(name)
-            # Convert back to (top, right, bottom, left) so rest of code doesn't break
-            top = y
-            right = x + w
-            bottom = y + h
-            left = x
-            face_locations.append((top, right, bottom, left))
+            preprocessed = self.preprocess_face(face_roi)
 
-        return face_locations, face_names
+            student_id = "Unknown"
+            name = "Unknown"
+            prn = ""
+            confidence = 0.0
+            matched = False
+
+            if self.model_trained and len(self.known_face_names) > 0 and preprocessed is not None:
+                try:
+                    label_id, distance = self.recognizer.predict(preprocessed)
+                    # Convert LBPH distance to calibrated 0.0-1.0 confidence score
+                    # Distances: <45 is very strong, 45-65 is confident, >65 is unknown
+                    calculated_conf = max(0.1, min(0.98, round(1.0 - (distance / 85.0), 2)))
+
+                    if distance < 65 and label_id in self.known_students:
+                        student_info = self.known_students[label_id]
+                        name = student_info.get("name", "Unknown")
+                        student_id = student_info.get("student_id", f"STU{label_id:03d}")
+                        prn = student_info.get("prn", "")
+                        confidence = calculated_conf
+                        matched = True
+                    elif distance < 72 and label_id in self.known_students:
+                        # Moderate confidence match
+                        student_info = self.known_students[label_id]
+                        name = student_info.get("name", "Unknown")
+                        student_id = student_info.get("student_id", "")
+                        prn = student_info.get("prn", "")
+                        confidence = round(calculated_conf * 0.85, 2)
+                        matched = False  # treat as unverified
+                    else:
+                        name = "Unknown"
+                        confidence = round(max(0.15, calculated_conf * 0.4), 2)
+                except Exception as e:
+                    pass
+
+            results.append({
+                "boundingBox": {
+                    "x": int(x),
+                    "y": int(y),
+                    "width": int(w),
+                    "height": int(h)
+                },
+                "face_id": f"face_{x}_{y}",
+                "student_id": student_id,
+                "name": name,
+                "prn": prn,
+                "confidence": confidence,
+                "matched": matched
+            })
+
+        return results
+
+    def process_frame_full(self, frame, attentiveness_tracker=None):
+        """Processes frame for both Face Recognition and Attentiveness Tracking"""
+        face_results = self.identify_faces(frame)
+        if not face_results:
+            return []
+
+        # If attentiveness tracker is provided, calculate EAR and 3D pose
+        if attentiveness_tracker:
+            try:
+                att_results = attentiveness_tracker.process_frame(frame)
+                # Match attentiveness results to face bounding boxes using spatial overlap (IoU)
+                for f in face_results:
+                    fbox = f["boundingBox"]
+                    fx1, fy1, fx2, fy2 = fbox["x"], fbox["y"], fbox["x"] + fbox["width"], fbox["y"] + fbox["height"]
+                    best_match = None
+                    best_iou = 0.0
+
+                    for att in att_results:
+                        ax1, ay1, ax2, ay2 = att["bbox"]
+                        # Intersection
+                        ix1 = max(fx1, ax1)
+                        iy1 = max(fy1, ay1)
+                        ix2 = min(fx2, ax2)
+                        iy2 = min(fy2, ay2)
+                        iw = max(0, ix2 - ix1)
+                        ih = max(0, iy2 - iy1)
+                        intersection = iw * ih
+                        f_area = fbox["width"] * fbox["height"]
+                        a_area = (ax2 - ax1) * (ay2 - ay1)
+                        union = f_area + a_area - intersection
+                        iou = intersection / union if union > 0 else 0
+
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_match = att
+
+                    if best_match and best_iou > 0.2:
+                        f["ear"] = round(float(best_match.get("ear", 0.25)), 3)
+                        f["pitch"] = round(float(best_match.get("pitch", 0.0)), 2)
+                        f["yaw"] = round(float(best_match.get("yaw", 0.0)), 2)
+                        f["is_drowsy"] = bool(best_match.get("is_drowsy", False))
+                        f["is_distracted"] = bool(best_match.get("is_distracted", False))
+                        f["is_attentive"] = bool(best_match.get("is_attentive", True))
+
+                        # Calculate attentiveness score (0.0 to 1.0)
+                        if f["is_drowsy"]:
+                            score = max(0.2, min(0.45, f["ear"] * 2.0))
+                        elif f["is_distracted"]:
+                            yaw_penalty = min(0.5, abs(f["yaw"]) / 90.0)
+                            pitch_penalty = min(0.3, abs(f["pitch"]) / 90.0)
+                            score = max(0.3, round(1.0 - (yaw_penalty + pitch_penalty), 2))
+                        else:
+                            score = round(0.85 + (min(0.35, f["ear"]) * 0.3), 2)
+                        f["attentiveness"] = min(0.99, max(0.15, score))
+                    else:
+                        f["is_attentive"] = True
+                        f["is_drowsy"] = False
+                        f["is_distracted"] = False
+                        f["attentiveness"] = 0.88
+            except Exception as e:
+                print(f"Attentiveness tracking notice: {e}")
+                for f in face_results:
+                    f["is_attentive"] = True
+                    f["is_drowsy"] = False
+                    f["is_distracted"] = False
+                    f["attentiveness"] = 0.88
+        else:
+            for f in face_results:
+                f["is_attentive"] = True
+                f["is_drowsy"] = False
+                f["is_distracted"] = False
+                f["attentiveness"] = 0.88
+
+        return face_results
 
 if __name__ == "__main__":
-    # Example usage / Test
     tracker = FaceTracker()
-    # tracker.register_from_webcam("Student 1")
+    print("Known students:", tracker.known_students)

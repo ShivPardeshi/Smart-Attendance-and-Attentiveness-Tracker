@@ -187,21 +187,33 @@ class MockDatabase:
             "is_active": True
         })
 
-        # 3. Student
-        self.students.insert_one({
-            "_id": "student_demo_id",
-            "student_id": "STU001",
-            "prn": "2024001",
-            "password": "password123",
-            "name": "Demo Student",
-            "email": "student@test.com",
-            "teacher_id": teacher_id,
-            "face_id": 1,
-            "face_encoding": base64.b64encode(b"dummy_demo_face_encoding_data").decode('utf-8'),
-            "created_at": datetime.now(),
-            "updated_at": datetime.now(),
-            "is_active": True
-        })
+        # 3. Students
+
+        # Seed all known faces from face_names.json for seamless testing
+        initial_students = [
+            {"student_id": "STU000", "prn": "2024000", "name": "Shiv Pardeshi", "face_id": 0, "email": "shiv@smartclass.com"},
+            {"student_id": "STU001", "prn": "2024001", "name": "Demo Student", "face_id": 10, "email": "student@test.com"},
+            {"student_id": "STU002", "prn": "2024002", "name": "AKASH PATIL", "face_id": 1, "email": "akash@smartclass.com"},
+            {"student_id": "STU003", "prn": "2024003", "name": "President", "face_id": 2, "email": "president@smartclass.com"},
+            {"student_id": "STU004", "prn": "2024004", "name": "Shiv New", "face_id": 3, "email": "shiv.new@smartclass.com"},
+            {"student_id": "STU005", "prn": "2024005", "name": "Tanishq Jain", "face_id": 4, "email": "tanishq@smartclass.com"},
+        ]
+        for s in initial_students:
+            self.students.insert_one({
+                "_id": f"student_{s['student_id'].lower()}_id",
+                "student_id": s["student_id"],
+                "prn": s["prn"],
+                "password": "password123",
+                "name": s["name"],
+                "email": s["email"],
+                "teacher_id": teacher_id,
+                "face_id": s["face_id"],
+                "face_encoding": base64.b64encode(b"dummy_demo_face_encoding_data").decode('utf-8'),
+                "created_at": datetime.now(),
+                "updated_at": datetime.now(),
+                "is_active": True
+            })
+
 
         # 4. Timetable for all days so get_current_lecture works seamlessly
         days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
@@ -587,7 +599,9 @@ class SmartClassroomDB:
                 if lecture:
                     return {
                         "id": str(lecture["_id"]),
-                        "course_name": lecture["course_name"],
+                        "course_name": lecture.get("course_name", timetable.get("course_name", "AI & Computer Vision")),
+                        "course_code": lecture.get("course_code", timetable.get("course_code", "CS401")),
+                        "classroom": lecture.get("classroom", timetable.get("classroom", "Smart Lab 1")),
                         "scheduled_date": lecture["scheduled_date"],
                         "start_time": lecture["start_time"],
                         "end_time": lecture["end_time"],
@@ -614,6 +628,8 @@ class SmartClassroomDB:
                     return {
                         "id": str(lecture_doc["_id"]),
                         "course_name": lecture_doc["course_name"],
+                        "course_code": timetable.get("course_code", "CS401"),
+                        "classroom": timetable.get("classroom", "Smart Lab 1"),
                         "scheduled_date": lecture_doc["scheduled_date"],
                         "start_time": lecture_doc["start_time"],
                         "end_time": lecture_doc["end_time"],
@@ -642,25 +658,69 @@ class SmartClassroomDB:
             print(f"Error in start_lecture_monitoring: {e}")
             return False
     
+    def is_attendance_recorded(self, lecture_id, student_id, date=None):
+        """Check if student attendance is already recorded for lecture on specified date (or today)"""
+        if self.db is None:
+            self.connect()
+        attendance_collection = self.db.attendance
+        check_date = date or datetime.now()
+        start_of_day = datetime(check_date.year, check_date.month, check_date.day, 0, 0, 0)
+        end_of_day = datetime(check_date.year, check_date.month, check_date.day, 23, 59, 59)
+        
+        query = {
+            "student_id": str(student_id),
+            "lecture_id": str(lecture_id),
+            "lecture_date": {"": start_of_day, "": end_of_day}
+        }
+        rec = attendance_collection.find_one(query)
+        if rec:
+            return rec
+        query_prn = {
+            "prn": str(student_id),
+            "lecture_id": str(lecture_id),
+            "lecture_date": {"": start_of_day, "": end_of_day}
+        }
+        return attendance_collection.find_one(query_prn)
+
+    def get_student_by_face_id(self, face_id):
+        """Get student details by face ID"""
+        if self.db is None:
+            self.connect()
+        students_collection = self.db.students
+        try:
+            f_id = int(face_id)
+        except Exception:
+            f_id = face_id
+        student = students_collection.find_one({"face_id": f_id, "is_active": True})
+        if not student and isinstance(f_id, int):
+            student = students_collection.find_one({"face_id": str(f_id), "is_active": True})
+        return student
+
     def save_attendance(self, lecture_id, student_id, prn, name, confidence_score):
-        """Save attendance record"""
+        """Save attendance record (idempotent for same lecture on same day)"""
         if self.db is None:
             self.connect()
         attendance_collection = self.db.attendance
         
+        existing = self.is_attendance_recorded(lecture_id, student_id)
+        if existing:
+            return str(existing.get("_id", existing.get("id", "")))
+            
+        now = datetime.now()
         attendance_doc = {
-            "lecture_id": lecture_id,
-            "student_id": student_id,
-            "prn": prn,
+            "lecture_id": str(lecture_id),
+            "student_id": str(student_id),
+            "prn": str(prn),
             "name": name,
             "status": "present",
-            "check_in_time": datetime.now(),
-            "confidence_score": confidence_score,
-            "lecture_date": datetime.now()
+            "check_in_time": now,
+            "confidence_score": float(confidence_score),
+            "lecture_date": now
         }
         
         result = attendance_collection.insert_one(attendance_doc)
         return str(result.inserted_id)
+
     
     def save_attentiveness_data(self, lecture_id, student_id, prn, ear, head_pitch, head_yaw, is_drowsy, is_distracted, is_attentive):
         """Save attentiveness tracking data"""

@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    environment:
+      - PORT=5001
+      - USE_MOCK_DB=true
+      - JWT_SECRET=smart-classroom-super-secret-key-production-2026
+      - FLASK_SECRET_KEY=smart-classroom-flask-key-production-2026
+    restart: unless-stopped
+    volumes:
+      - ./face_names.json:/app/face_names.json
+      - ./face_metadata.json:/app/face_metadata.json
+      - ./face_model.yml:/app/face_model.yml
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:5001
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      - backend
+    restart: unless-stopped

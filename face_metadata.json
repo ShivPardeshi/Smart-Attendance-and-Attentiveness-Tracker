@@ -1,0 +1,45 @@
+{
+  "0": {
+    "face_id": 0,
+    "name": "Shiv Pardeshi",
+    "student_id": "STU000",
+    "prn": "2024000"
+  },
+  "10": {
+    "face_id": 10,
+    "name": "Demo Student",
+    "student_id": "STU001",
+    "prn": "2024001"
+  },
+  "1": {
+    "face_id": 1,
+    "name": "AKASH PATIL",
+    "student_id": "STU002",
+    "prn": "2024002"
+  },
+  "2": {
+    "face_id": 2,
+    "name": "President",
+    "student_id": "STU003",
+    "prn": "2024003"
+  },
+  "3": {
+    "face_id": 3,
+    "name": "Shiv New",
+    "student_id": "STU004",
+    "prn": "2024004"
+  },
+  "4": {
+    "face_id": 4,
+    "name": "Tanishq Jain",
+    "student_id": "STU005",
+    "prn": "2024005"
+  },
+  "11": {
+    "face_id": 11,
+    "student_id": "STU999",
+    "prn": "2024999",
+    "name": "Test Registration Student",
+    "email": "test999@smartclass.com"
+  }
+}

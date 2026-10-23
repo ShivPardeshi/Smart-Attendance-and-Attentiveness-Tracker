@@ -48,3 +48,9 @@ Thumbs.db
 # Logs
 *.log
 *copy*/
+
+# Build outputs
+dist/
+frontend/dist/
+build/
+*.egg-info/
